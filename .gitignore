@@ -1,0 +1,22 @@
+# Build output
+src/bin/
+src/obj/
+*.exe
+*.pdb
+*.dll
+
+# Runtime / personal data - never commit these
+# 长期记忆、学术词汇、术语本等个人数据
+data/
+config.txt
+*.log
+litreader.log
+window.txt
+draft.txt
+
+# Editor / OS
+.vs/
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini

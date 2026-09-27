@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" DefaultTargets="Build"
+         xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <PropertyGroup>
+    <ProjectGuid>{7A3F2C91-4B6E-4D2A-9C81-5E0F1A2B3C4D}</ProjectGuid>
+    <OutputType>WinExe</OutputType>
+    <RootNamespace>LitReader</RootNamespace>
+    <AssemblyName>LitReaderFloat</AssemblyName>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <OutputPath>bin\</OutputPath>
+    <Configuration>Release</Configuration>
+    <PlatformTarget>x64</PlatformTarget>
+    <WarningLevel>4</WarningLevel>
+    <CodePage>65001</CodePage>
+    <LangVersion>5</LangVersion>
+    <!-- 入口由 App.cs 的 Main 提供（单实例 + 托盘），不生成 WPF 默认入口 -->
+    <StartupObject>LitReader.App</StartupObject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.Data" />
+    <Reference Include="System.Xml" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Net.Http" />
+    <Reference Include="WindowsBase" />
+    <Reference Include="PresentationCore" />
+    <Reference Include="PresentationFramework" />
+    <Reference Include="System.Xaml" />
+    <Reference Include="UIAutomationClient" />
+    <Reference Include="UIAutomationTypes" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Page Include="FloatWindow.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Compile Include="FloatWindow.xaml.cs">
+      <DependentUpon>FloatWindow.xaml</DependentUpon>
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="App.cs" />
+    <Compile Include="AppConfig.cs" />
+    <Compile Include="MouseHook.cs" />
+    <Compile Include="SelectionReader.cs" />
+    <Compile Include="MarkdownRenderer.cs" />
+    <Compile Include="SmoothScroll.cs" />
+  </ItemGroup>
+
+  <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
+</Project>
