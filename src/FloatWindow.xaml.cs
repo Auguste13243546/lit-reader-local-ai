@@ -30,8 +30,13 @@ namespace LitReader
         static string OllamaBase { get { return AppConfig.OllamaBase; } }
         const string ModelText = "lit-reader";
         const string ModelVision = "lit-reader-vision";
-        const int CtxText = 16384;
-        const int CtxVision = 8192;
+        // 上下文长度按本机显存实测选定（RTX 5060 Laptop，8151 MiB）：
+        // 24576 是仍能 100% 驻留 GPU 的最大窗口；32768 会让约 11% 的层掉到 CPU，
+        // 生成速度从 57 tok/s 掉到 35 tok/s。中文字符约 0.616 token，因此 24K
+        // 约可容纳 4 万汉字。依据见 docs/tuning.md。
+        const int CtxText = 24576;
+        // 视觉模式带 456M 的 CLIP 投影器，显存更紧，取 12K 留出安全余量。
+        const int CtxVision = 12288;
 
         // ---------- 全局热键 ----------
         [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
@@ -63,20 +68,29 @@ namespace LitReader
         bool grabbing = false;          // 防止取文本流程重入
 
         // ================= 模式与长期记忆 =================
-        // 两个模式各自独立的上下文，互不串味：
+        // 三个模式各自独立的上下文，互不串味：
         //   lit  = 文献术语助手（默认）
         //   life = 生活助手，对话结束后自动总结，并作为长期记忆回读
-        enum AssistantMode { Lit, Life }
+        //   work = 工作助手，同样有独立上下文与长期记忆，但记忆统一放在「工作记忆」
+        // 三者共用同一个底层模型实例（同样的 num_ctx），避免 Ollama 同时驻留多份
+        // 权重把 8 GB 显存挤爆。
+        enum AssistantMode { Lit, Life, Work }
         AssistantMode mode = AssistantMode.Lit;
 
         readonly List<object[]> litHistory = new List<object[]>();
         readonly List<object[]> lifeHistory = new List<object[]>();
+        readonly List<object[]> workHistory = new List<object[]>();
 
-        // 生活助手长期记忆（三层）：rolling = 滚动总记忆；archive = 每次会话的摘要文件
+        // 长期记忆（三层）：rolling = 滚动总记忆；archive = 每次会话的摘要文件。
+        // life 与 work 各存一份记忆，但统一放在「工作记忆」目录下，便于人查阅；
+        // lit 模式没有长期记忆。
         // 目录来自 AppConfig（默认 <程序目录>\data），不硬编码个人路径
         static string MemRoot { get { return AppConfig.DataDir; } }
         string rollingMemory = null;      // 已加载的滚动记忆文本（注入上下文用）
-        bool lifeDirty = false;           // 本会话是否有新内容待总结
+        bool memoryDirty = false;         // 当前模式的会话是否有新内容待总结
+        // 总结是后台异步的（要发网络请求），期间用户可能已经切走模式，
+        // 因此锁定发起时的模式，保证结果写回它自己那份记忆文件。
+        AssistantMode modeAtSummary = AssistantMode.Lit;
 
         // 空闲超时触发总结（分钟）
         DispatcherTimer idleTimer;
@@ -111,14 +125,14 @@ namespace LitReader
         {
             CheckFocusGuard();      // 焦点守卫（每 1 分钟也会兜一次）
 
-            if (mode != AssistantMode.Life) return;
+            if (mode != AssistantMode.Life && mode != AssistantMode.Work) return;
             if (busy || grabbing) return;
-            if (!lifeDirty) return;
-            if (lifeHistory.Count == 0) return;
+            if (!memoryDirty) return;
+            if (CurrentHistory.Count == 0) return;
             if ((DateTime.Now - lastActivity).TotalMinutes < idleMinutes) return;
 
-            App.Log("idle " + idleMinutes + "min -> summarizing life session");
-            SummarizeLifeSession("空闲超时", null);
+            App.Log("idle " + idleMinutes + "min -> summarizing " + mode + " session");
+            SummarizeModeSession("空闲超时", null);
         }
 
         public FloatWindow()
@@ -169,30 +183,66 @@ namespace LitReader
         // ================= 模式切换 =================
         List<object[]> CurrentHistory
         {
-            get { return mode == AssistantMode.Life ? lifeHistory : litHistory; }
+            get
+            {
+                if (mode == AssistantMode.Life) return lifeHistory;
+                if (mode == AssistantMode.Work) return workHistory;
+                return litHistory;
+            }
         }
 
         string MemoryDir
         {
             get
             {
-                string sub = mode == AssistantMode.Life ? "生活" : "学术词汇";
-                return IoPath.Combine(MemRoot, sub);
+                if (mode == AssistantMode.Lit) return IoPath.Combine(MemRoot, "学术词汇");
+                // 生活与工作各存一份记忆，但都放在「工作记忆」目录下，
+                // 便于在一次会话里同时查阅两类长期记忆。
+                return IoPath.Combine(MemRoot, "工作记忆", mode == AssistantMode.Work ? "工作" : "生活");
             }
         }
 
         string RollingMemoryFile { get { return IoPath.Combine(MemoryDir, "长期记忆.md"); } }
 
+        // 上一版把生活记忆直接放在 data\生活\ 下；改版后挪到了 [工作记忆]\生活\。
+        // 这里保留对旧路径的兼容，否则升级后既有记忆会读不到（表现为助手「失忆」）。
+        static string LegacyLifeMemoryFile
+        {
+            get { return IoPath.Combine(IoPath.Combine(MemRoot, "生活"), "长期记忆.md"); }
+        }
+
+        // 把旧路径的记忆原样复制到新路径（复制而非移动，失败也不丢原文件）
+        static void MigrateLegacyLifeMemory(string destFile)
+        {
+            try
+            {
+                if (File.Exists(destFile)) return;                 // 新路径已有内容，不动
+                if (!File.Exists(LegacyLifeMemoryFile)) return;    // 没有旧文件，无需迁移
+                string parent = IoPath.GetDirectoryName(destFile);
+                if (!string.IsNullOrEmpty(parent) && !Directory.Exists(parent))
+                    Directory.CreateDirectory(parent);
+                File.Copy(LegacyLifeMemoryFile, destFile, false);
+                App.Log("migrated legacy life memory -> " + destFile);
+            }
+            catch (Exception ex) { App.Log("legacy memory migration failed: " + ex.Message); }
+        }
+
         void BtnMode_Click(object sender, RoutedEventArgs e)
         {
             if (busy) { App.Log("mode switch ignored: busy"); return; }
 
-            // 切走生活助手前，把未总结内容交给后台异步总结（不阻塞切模式）
-            if (mode == AssistantMode.Life && lifeDirty && lifeHistory.Count > 0)
-                SummarizeLifeSession("切换模式", new List<object[]>(lifeHistory));
+            // 切走前先把当前模式的未总结内容交给后台异步总结（用快照，不阻塞切换）
+            if (mode != AssistantMode.Lit && memoryDirty && CurrentHistory.Count > 0)
+                SummarizeModeSession("切换模式", new List<object[]>(CurrentHistory));
 
-            mode = (mode == AssistantMode.Lit) ? AssistantMode.Life : AssistantMode.Lit;
+            // 三态循环：文献 -> 生活 -> 工作 -> 文献
+            if (mode == AssistantMode.Lit) mode = AssistantMode.Life;
+            else if (mode == AssistantMode.Life) mode = AssistantMode.Work;
+            else mode = AssistantMode.Lit;
             App.Log("mode -> " + mode);
+
+            // 模式标签在切过去之前就刷新，保证标题显示的是「刚才用过」的那个模式
+            RefreshToggles();
 
             SaveDraft();      // 保留切模式前的输入
             MsgPanel.Children.Clear();
@@ -210,12 +260,15 @@ namespace LitReader
             rollingMemory = null;
             try
             {
+                // 生活模式：先把旧版路径的记忆迁移过来，再读取（幂等，失败不影响启动）
+                if (mode == AssistantMode.Life) MigrateLegacyLifeMemory(RollingMemoryFile);
+
                 if (!File.Exists(RollingMemoryFile)) { App.Log("no memory file yet: " + RollingMemoryFile); return; }
                 string t = File.ReadAllText(RollingMemoryFile, Encoding.UTF8);
                 if (!string.IsNullOrEmpty(t.Trim()))
                 {
                     rollingMemory = t.Trim();
-                    App.Log("memory loaded, len=" + rollingMemory.Length);
+                    App.Log("memory loaded, mode=" + mode + ", len=" + rollingMemory.Length);
                 }
             }
             catch (Exception ex) { App.Log("memory load failed: " + ex.Message); }
@@ -225,22 +278,29 @@ namespace LitReader
         // 三层结构：
         //   长期记忆.md   —— 滚动记忆，每次会话后合并更新；下次会话注入上下文
         //   会话记录/     —— 每次会话的独立摘要存档，供人查阅（不注入上下文）
-        // snapshot 为 null 时使用当前 lifeHistory；传入快照可在清空历史后仍异步总结。
+        // snapshot 为 null 时使用当前模式的历史；传入快照可在清空历史后仍异步总结。
         // 注意：总结走网络请求（约数秒），绝不能阻塞 UI 线程。
-        void SummarizeLifeSession(string reason, List<object[]> snapshot)
+        void SummarizeModeSession(string reason, List<object[]> snapshot)
         {
-            List<object[]> src = snapshot != null ? snapshot : lifeHistory;
+            List<object[]> src = snapshot != null ? snapshot : CurrentHistory;
             if (src == null || src.Count == 0) return;
 
-            App.Log("summarize start (" + reason + "), msgs=" + src.Count);
+            // 锁定发起时的模式：总结是异步的，期间用户可能已经切走，
+            // 而 MemoryDir / RollingMemoryFile 依赖当前 mode，因此在这里就
+            // 把落盘路径定下来，回调里只用捕获值，避免写错模式的文件。
+            modeAtSummary = mode;
+            string memFile = RollingMemoryFile;
+            if (src == snapshot && memoryDirty) memoryDirty = false;
+
+            App.Log("summarize start (" + reason + "), mode=" + mode + ", msgs=" + src.Count);
             string convo = BuildPlainTranscript(src);
             string oldMem = rollingMemory == null ? "(暂无)" : rollingMemory;
-            string stamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
             int msgCount = src.Count;
 
             // 一次调用同时产出：滚动记忆（合并）与会话摘要（独立）
             string prompt =
-                "你在维护我的个人生活助手长期记忆。请阅读【已有长期记忆】和【本次对话】，输出两段内容，严格按下面格式，" +
+                "你在维护我" + (mode == AssistantMode.Work ? "的工作助手" : "的个人生活助手") +
+                "长期记忆。请阅读【已有长期记忆】和【本次对话】，输出两段内容，严格按下面格式，" +
                 "不要输出任何其它文字：\n\n" +
                 "===ROLLING===\n" +
                 "（把本次对话中值得长期记住的新信息合并进已有记忆，输出更新后的完整记忆；" +
@@ -259,14 +319,26 @@ namespace LitReader
 
                     if (!string.IsNullOrEmpty(rolling))
                     {
-                        File.WriteAllText(RollingMemoryFile,
+                        // 用发起总结时捕获的路径，而不是回调执行时的当前模式
+                        File.WriteAllText(memFile,
                             "# 长期记忆（自动维护）\n\n最后更新：" + DateTime.Now.ToString("yyyy-MM-dd HH:mm") +
                             "\n\n" + rolling + "\n", Encoding.UTF8);
-                        rollingMemory = rolling;
+                        // 只有用户仍停留在该模式时才刷新注入用的内存副本
+                        if (mode == modeAtSummary) rollingMemory = rolling;
                         App.Log("rolling memory updated, len=" + rolling.Length);
+
+                        // 新路径已写成功，旧版残留的副本可以清掉了，避免两份记忆并存
+                        if (modeAtSummary == AssistantMode.Life)
+                        {
+                            try
+                            {
+                                if (File.Exists(LegacyLifeMemoryFile)) File.Delete(LegacyLifeMemoryFile);
+                            }
+                            catch (Exception ex) { App.Log("legacy memory cleanup skipped: " + ex.Message); }
+                        }
                     }
 
-                    lifeDirty = false;
+                    if (mode == modeAtSummary) memoryDirty = false;
                     Dispatcher.BeginInvoke(new Action(delegate
                     {
                         AddBubble("assistant", "（本次对话已总结并存入长期记忆：" +
@@ -355,7 +427,9 @@ namespace LitReader
             var req = new List<object[]>();
             req.Add(new object[] { "user", new Dictionary<string, object> { { "role", "user" }, { "content", prompt } } });
 
-            RunCompletion(ModelText, 8192, false, req,
+            // 上下文用 CtxText 而不是写死的 8192：总结要读整段对话，
+            // 8K 会让较长会话的后半段被静默截断，导致长期记忆有损。
+            RunCompletion(ModelText, CtxText, false, req,
                 delegate(string output)
                 {
                     try
@@ -1123,9 +1197,9 @@ namespace LitReader
                 lifeHistory.Add(new object[] { seed[i, 0],
                     new Dictionary<string, object> { { "role", seed[i, 0] }, { "content", seed[i, 1] } } });
             }
-            lifeDirty = true;
+            memoryDirty = true;
             App.Log("=== summarize test start, seeded msgs=" + lifeHistory.Count + " ===");
-            SummarizeLifeSession("测试", null);
+            SummarizeModeSession("测试", null);
         }
 
         // ---- 供自动化测试调用（--memory-preview）----
@@ -1134,6 +1208,7 @@ namespace LitReader
             mode = AssistantMode.Life;
             LoadLongTermMemory();
             App.Log("=== memory preview ===");
+            // 先 LoadLongTermMemory（其中含旧路径迁移），再检查文件是否存在
             App.Log("file=" + RollingMemoryFile + " exists=" + File.Exists(RollingMemoryFile));
             App.Log("rollingMemory len=" + (rollingMemory == null ? 0 : rollingMemory.Length));
             if (rollingMemory != null) App.Log("content >>>\n" + rollingMemory + "\n<<< end");
@@ -1685,8 +1760,12 @@ namespace LitReader
             SetToggle(BtnThink, thinkMode, null, null);
             SetToggle(BtnVision, visionMode, null, null);
             SetToggle(BtnPaste, autoPaste, "划词·开", "划词·关");
-            SetToggle(BtnMode, mode == AssistantMode.Life, "生活", "文献");
-            TxtMode.Text = mode == AssistantMode.Life ? "生活助手" : "文献术语";
+            SetToggle(BtnMode, mode != AssistantMode.Lit,
+                      mode == AssistantMode.Work ? "工作" : "生活", "文献");
+            // 三态无法用开关表达，标题文字给出确切状态。
+            // 顺序按按钮循环顺序排列：文献 -> 生活 -> 工作，读起来才是连贯的。
+            TxtMode.Text = mode == AssistantMode.Lit ? "文献术语"
+                         : mode == AssistantMode.Life ? "生活助手" : "工作助手";
             TxtStatus.Text = hotkeyLabel + (thinkMode ? " · 思考" : " · 快答") + (visionMode ? " · 视觉" : "");
         }
 
@@ -1701,7 +1780,22 @@ namespace LitReader
                     "生活助手模式。日常问题都可以问我：饮食、健康、出行、购物、计划、写作等。\n" +
                     "· 上下文与文献模式完全独立\n" +
                     "· 本次对话结束（空闲 " + idleMinutes + " 分钟或点「新对话」）后会自动总结，" +
-                    "并存入 " + IoPath.Combine(MemRoot, "生活") + "\\ " + mem);
+                    "并存入 " + IoPath.Combine(MemRoot, "工作记忆", "生活") + "\\ " + mem);
+                return;
+            }
+
+            if (mode == AssistantMode.Work)
+            {
+                string mem = string.IsNullOrEmpty(rollingMemory)
+                    ? "（暂无长期记忆，本次对话结束后会自动建立）"
+                    : "（已载入跨会话长期记忆）";
+                AddBubble("assistant",
+                    "工作助手模式。周报、邮件通知、公文润色、文档总结、数据整理、" +
+                    "会议纪要、脚本调错都可以交给我。\n" +
+                    "· 上下文与文献、生活模式完全独立\n" +
+                    "· 上下文约可容纳 4 万汉字（24K 上下文实测边界）\n" +
+                    "· 本次对话结束（空闲 " + idleMinutes + " 分钟或点「新对话」）后会自动总结，" +
+                    "并存入 " + IoPath.Combine(MemRoot, "工作记忆", "工作") + "\\ " + mem);
                 return;
             }
 
@@ -2450,12 +2544,9 @@ namespace LitReader
         {
             if (busy) return;
 
-            // 生活助手：开新对话前先把旧会话交给后台总结（用快照，清空后仍能完成）
-            if (mode == AssistantMode.Life && lifeDirty && lifeHistory.Count > 0)
-            {
-                SummarizeLifeSession("手动新对话", new List<object[]>(lifeHistory));
-                lifeDirty = false;
-            }
+            // 开新对话前先把旧会话交给后台总结（用快照，清空后仍能完成）
+            if (mode != AssistantMode.Lit && memoryDirty && CurrentHistory.Count > 0)
+                SummarizeModeSession("手动新对话", new List<object[]>(CurrentHistory));
 
             CurrentHistory.Clear();
             MsgPanel.Children.Clear();
@@ -2576,24 +2667,47 @@ namespace LitReader
         {
             var msgs = new List<object[]>();
 
-            string sys = mode == AssistantMode.Life
-                ? "你是一位可靠、务实的生活助手。回答日常问题：饮食、健康、出行、购物、家庭事务、写作、计划安排等。\n" +
-                  "要求：\n" +
-                  "1. 直接给可执行的建议，不要空泛。\n" +
-                  "2. 涉及健康、用药、法律、投资等高风险话题时，明确提示风险，并建议咨询专业人士。\n" +
-                  "3. 不确定就说不确定，不要编造。\n" +
-                  "4. 用中文回答，简洁、口语化。"
-                : "你是一位学术文献阅读助手，专长是解释各学科的专业术语。\n" +
-                  "规则：\n" +
-                  "1. 先用一句话给出该术语的准确中文定义。\n" +
-                  "2. 再说明它在当前文献语境中的具体含义与作用。\n" +
-                  "3. 如有必要，补充英文全称、其他常见中文译名、以及一个简短类比或例子。\n" +
-                  "4. 只解释你有把握的内容。不确定时明确说明该术语在此领域存在歧义，绝不编造。\n" +
-                  "5. 默认用中文回答，但保留原始英文术语。\n" +
-                  "6. 回答保持精炼，控制在 200 字以内，除非用户要求展开。";
+            string sys;
+            if (mode == AssistantMode.Life)
+            {
+                sys = "你是一位可靠、务实的生活助手。回答日常问题：饮食、健康、出行、购物、家庭事务、写作、计划安排等。\n" +
+                      "要求：\n" +
+                      "1. 直接给可执行的建议，不要空泛。\n" +
+                      "2. 涉及健康、用药、法律、投资等高风险话题时，明确提示风险，并建议咨询专业人士。\n" +
+                      "3. 不确定就说不确定，不要编造。\n" +
+                      "4. 用中文回答，简洁、口语化。";
+            }
+            else if (mode == AssistantMode.Work)
+            {
+                // 工作模式刻意不继承文献模式「200 字以内」的约束 ——
+                // 那条规则会把周报、纪要、汇总全部压成残句。长度按任务本身需要来定。
+                sys = "你是一位专业、务实的办公助手，负责中文办公写作与资料处理。\n" +
+                      "你可能被要求：撰写或润色周报、邮件、通知、公文；总结长文档；\n" +
+                      "整理表格数据；整理会议纪要；编写或排查脚本。\n" +
+                      "要求：\n" +
+                      "1. 产出可直接使用的成品，不要写「以下是一份…」这类空话，也不要复述我的要求。\n" +
+                      "2. 篇幅按任务需要决定，该长就长、该短就短，不要硬凑也不要截断。\n" +
+                      "3. 结构化输出优先用标题、编号、Markdown 表格；公文用规范中文书面语。\n" +
+                      "4. 需要我补充信息时，先给出基于现有信息的可用版本，再把缺口列成问题。\n" +
+                      "5. 涉及数据与事实时不要编造；原文没有的数字、人名、结论一律标注为待确认。\n" +
+                      "6. 代码与报错排查给出可运行的完整片段，并说明改了什么。\n" +
+                      "7. 默认用中文，保留必要的英文术语与代码标识符。";
+            }
+            else
+            {
+                sys = "你是一位学术文献阅读助手，专长是解释各学科的专业术语。\n" +
+                      "规则：\n" +
+                      "1. 先用一句话给出该术语的准确中文定义。\n" +
+                      "2. 再说明它在当前文献语境中的具体含义与作用。\n" +
+                      "3. 如有必要，补充英文全称、其他常见中文译名、以及一个简短类比或例子。\n" +
+                      "4. 只解释你有把握的内容。不确定时明确说明该术语在此领域存在歧义，绝不编造。\n" +
+                      "5. 默认用中文回答，但保留原始英文术语。\n" +
+                      "6. 回答保持精炼，控制在 200 字以内，除非用户要求展开。";
+            }
 
-            // 生活助手：注入长期记忆（滚动总结），实现跨会话记忆
-            if (mode == AssistantMode.Life && !string.IsNullOrEmpty(rollingMemory))
+            // 生活 / 工作助手：注入长期记忆（滚动总结），实现跨会话记忆。
+            // 文献模式是即问即答的术语查询，不参与长期记忆。
+            if (mode != AssistantMode.Lit && !string.IsNullOrEmpty(rollingMemory))
             {
                 sys += "\n\n以下是你此前为我维护的长期记忆，请在回答时参考它，" +
                        "但不要主动复述整段记忆，也不要提及\"记忆\"这个说法：\n" + rollingMemory;
@@ -2683,7 +2797,7 @@ namespace LitReader
             CurrentHistory.Add(new object[] { "user", userMsg });
 
             // 生活助手的会话内容需要被总结，标记为脏；并刷新空闲计时
-            if (mode == AssistantMode.Life) lifeDirty = true;
+            if (mode != AssistantMode.Lit) memoryDirty = true;
             TouchActivity();
 
             string model = visionMode ? ModelVision : ModelText;
@@ -2756,7 +2870,8 @@ namespace LitReader
                 sw.Stop();
                 string final = sb.ToString();
                 CurrentHistory.Add(new object[] { "assistant", new Dictionary<string, object> { { "role", "assistant" }, { "content", final } } });
-                if (mode == AssistantMode.Life) TouchActivity();
+                // 空闲计时对生活/工作模式都生效，两者都要重置活动时间
+                if (mode != AssistantMode.Lit) TouchActivity();
 
                 double secs = sw.Elapsed.TotalSeconds;
                 string stat = "";
